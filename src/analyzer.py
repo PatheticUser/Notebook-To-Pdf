@@ -1,12 +1,18 @@
-import json
 import logging
 from typing import List
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from parser import ParsedNotebook, NotebookCell
-from llm_manager import call_llm
+from llm_manager import get_llm
+from langchain_core.prompts import ChatPromptTemplate
 
 logger = logging.getLogger("nb2pdf.analyzer")
+
+class LLMAnalysisResult(BaseModel):
+    """Evaluation of a Jupyter Notebook cell for PDF inclusion."""
+    classification: str = Field(description="One of: TRIVIAL, INFORMATIONAL, CRITICAL")
+    action: str = Field(description="One of: SKIP, INCLUDE, SUMMARIZE")
+    explanation: str = Field(description="Concise explanation/summary of the cell (leave empty if not needed)", default="")
 
 class AnalyzedCell(BaseModel):
     original_cell: NotebookCell
@@ -14,7 +20,7 @@ class AnalyzedCell(BaseModel):
     action: str          # INCLUDE, SUMMARIZE, SKIP
     explanation: str = ""
 
-def build_prompt(cell: NotebookCell, prev_context: str) -> str:
+def build_prompt_vars(cell: NotebookCell, prev_context: str) -> dict:
     outputs_repr = ""
     for out in cell.outputs:
         text = out.text or ""
@@ -28,20 +34,16 @@ def build_prompt(cell: NotebookCell, prev_context: str) -> str:
             
         outputs_repr += f"[{out.output_type}] {text}\n"
         
-    return f"""You are an elite software engineering assistant compiling a high-quality PDF report from a Jupyter Notebook.
+    return {
+        "cell_type": cell.cell_type,
+        "source": cell.source,
+        "outputs": outputs_repr if outputs_repr else "None",
+        "prev_context": prev_context
+    }
+
+prompt_template = ChatPromptTemplate.from_messages([
+    ("system", """You are an elite software engineering assistant compiling a high-quality PDF report from a Jupyter Notebook.
 Evaluate the following notebook cell and decide how to handle it.
-
-Cell Type: {cell.cell_type}
-Source Code/Markdown:
-```
-{cell.source}
-```
-
-Outputs:
-{outputs_repr if outputs_repr else "None"}
-
-Previous Context (for continuous reading flow):
-{prev_context}
 
 Rules for evaluation:
 - TRIVIAL: Boilerplate imports, simple print statements, empty cells, or noisy pip installs. Action: SKIP.
@@ -51,15 +53,20 @@ Rules for evaluation:
 Actions:
 - SKIP: Do not include in final document.
 - INCLUDE: Keep as is. If the cell is complex code, provide a concise 'explanation' outlining its purpose.
-- SUMMARIZE: Replace the literal code/outputs with a clean summary in 'explanation'. Prefer this over repetition.
+- SUMMARIZE: Replace the literal code/outputs with a clean summary in 'explanation'. Prefer this over repetition."""),
+    ("user", """Cell Type: {cell_type}
+Source Code/Markdown:
+```
+{source}
+```
 
-Output exactly in JSON format:
-{{
-    "classification": "TRIVIAL" | "INFORMATIONAL" | "CRITICAL",
-    "action": "SKIP" | "INCLUDE" | "SUMMARIZE",
-    "explanation": "Your concise explanation/summary here (leave empty if not needed)"
-}}
-"""
+Outputs:
+{outputs}
+
+Previous Context (for continuous reading flow):
+{prev_context}
+""")
+])
 
 def analyze_cell(cell: NotebookCell, prev_context: str = "") -> AnalyzedCell:
     # Fast path for empty cells
@@ -70,36 +77,21 @@ def analyze_cell(cell: NotebookCell, prev_context: str = "") -> AnalyzedCell:
             action="SKIP"
         )
         
-    # If the markdown is just simple text/headings without need for AI filtering, maybe skip LLM?
-    # Let's let the LLM decide everything for maximum intelligence as requested.
+    prompt_vars = build_prompt_vars(cell, prev_context)
     
-    prompt = build_prompt(cell, prev_context)
-    
+    # Get LangChain LLM with structured output
     try:
-        response_text = call_llm(
-            messages=[
-                {"role": "system", "content": "You are a professional technical writer and data scientist. Output strictly valid JSON without wrapping markdown blocks. Just the JSON object."},
-                {"role": "user", "content": prompt}
-            ],
-            model="llama-3.1-8b-instant" # Fast lightweight model
-        )
+        llm = get_llm(model="llama-3.1-8b-instant")
+        structured_llm = llm.with_structured_output(LLMAnalysisResult)
+        chain = prompt_template | structured_llm
         
-        # Clean response text
-        response_text = response_text.strip()
-        if response_text.startswith("```json"):
-            response_text = response_text[7:]
-        elif response_text.startswith("```"):
-            response_text = response_text[3:]
-        if response_text.endswith("```"):
-            response_text = response_text[:-3]
-            
-        data = json.loads(response_text.strip())
+        result = chain.invoke(prompt_vars)
         
         return AnalyzedCell(
             original_cell=cell,
-            classification=data.get("classification", "INFORMATIONAL").upper(),
-            action=data.get("action", "INCLUDE").upper(),
-            explanation=data.get("explanation", "").strip()
+            classification=result.classification.upper(),
+            action=result.action.upper(),
+            explanation=result.explanation.strip()
         )
     except Exception as e:
         logger.error(f"Failed to analyze cell {cell.index}: {e}. Defaulting to INCLUDE.")

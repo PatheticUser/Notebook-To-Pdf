@@ -1,11 +1,10 @@
 [project]
-name = "nb2pdf"
+name = "notebook-converter"
 version = "0.1.0"
-description = "Add your description here"
+description = "AI-Powered Jupyter to PDF formatting tool"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "groq>=1.1.1",
     "markdown>=3.10.2",
     "nbformat>=5.10.4",
     "pydantic>=2.12.5",
@@ -13,4 +12,6 @@ dependencies = [
     "tenacity>=9.1.4",
     "typer>=0.24.1",
     "weasyprint>=68.1",
+    "langchain-core",
+    "langchain-groq",
 ]
